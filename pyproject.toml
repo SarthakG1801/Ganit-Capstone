@@ -9,6 +9,9 @@ dependencies = [
     "matplotlib>=3.11.0",
     "numpy>=2.5.1",
     "pandas>=3.0.3",
+    "plotly>=6.9.0",
+    "python-multipart>=0.0.32",
     "requests>=2.34.2",
     "seaborn>=0.13.2",
+    "sqlalchemy>=2.0.51",
 ]
