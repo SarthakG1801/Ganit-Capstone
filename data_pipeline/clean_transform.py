@@ -1,3 +1,14 @@
+"""
+Cleans the raw long-format exchange rate data and engineers the derived
+columns used throughout the EDA / API / dashboard (moving averages,
+volatility, daily % change, calendar features).
+
+Input:  data/processed/exchange_rates_raw_long.csv   (from fetch_data.py)
+Output: data/processed/exchange_rates_clean.csv       (Tableau-ready)
+
+Run:
+    python data_pipeline/clean_transform.py
+"""
 
 import os
 
@@ -6,6 +17,12 @@ import pandas as pd
 INPUT_PATH = "data/processed/exchange_rates_raw_long.csv"
 OUTPUT_PATH = "data/processed/exchange_rates_clean.csv"
 
+# Frankfurter (ECB-sourced) doesn't publish on weekends/holidays.
+# Choose how to handle those gaps:
+#   "flag"     -> reindex to every calendar day, keep gaps as NaN rate,
+#                 add is_trading_day so downstream tools can filter/ffill themselves
+#   "ffill"    -> reindex to every calendar day, forward-fill the rate itself
+#   "none"     -> leave the data exactly as returned (business days only, no reindex)
 MISSING_DATE_STRATEGY = "flag"
 
 
@@ -33,7 +50,11 @@ def drop_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def handle_missing_dates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
-
+    """
+    Reindexes each currency's series onto a full calendar-day range so that
+    weekends/holidays are explicit rather than silently absent, then applies
+    the chosen strategy for the resulting gaps.
+    """
     if strategy == "none":
         return df
 
@@ -54,7 +75,7 @@ def handle_missing_dates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
         out = out.sort_values(["target_currency", "date"])
         out["rate"] = out.groupby("target_currency")["rate"].ffill()
     elif strategy == "flag":
-        pass  
+        pass  # rate stays NaN on non-trading days; is_trading_day marks it
     else:
         raise ValueError(f"Unknown MISSING_DATE_STRATEGY: {strategy!r}")
 
@@ -65,14 +86,42 @@ def handle_missing_dates(df: pd.DataFrame, strategy: str) -> pd.DataFrame:
 
 
 def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes daily_pct_change, moving averages, and volatility.
+
+    Important: daily_pct_change must be computed against the previous
+    TRADING day, not the previous CALENDAR day. If the frame has been
+    reindexed to include weekend/holiday gap rows (rate = NaN), a naive
+    groupby().pct_change() on the full calendar-day series compares Monday
+    against Sunday's NaN and silently returns NaN for every single Monday
+    — a systematic gap, not random missingness, which would quietly bias
+    every volatility/seasonality calculation downstream.
+
+    To avoid that, derived columns are computed on the trading-days-only
+    subset (so each row is compared against the actual previous trading
+    day), then merged back onto the full frame — non-trading rows keep
+    NaN for all derived columns, same as before.
+    """
     df = df.sort_values(["target_currency", "date"]).reset_index(drop=True)
 
-    g = df.groupby("target_currency")["rate"]
-    df["daily_pct_change"] = g.pct_change()
-    df["ma_7"] = g.transform(lambda s: s.rolling(7, min_periods=7).mean())
-    df["ma_30"] = g.transform(lambda s: s.rolling(30, min_periods=30).mean())
-    df["volatility_30d"] = df.groupby("target_currency")["daily_pct_change"] \
-        .transform(lambda s: s.rolling(30, min_periods=30).std())
+    if "is_trading_day" in df.columns:
+        trading = df[df["is_trading_day"] == True].copy()  # noqa: E712
+    else:
+        trading = df.copy()
+
+    trading = trading.sort_values(["target_currency", "date"])
+    g = trading.groupby("target_currency")["rate"]
+    trading["daily_pct_change"] = g.pct_change()
+    trading["ma_7"] = g.transform(lambda s: s.rolling(7, min_periods=1).mean())
+    trading["ma_30"] = g.transform(lambda s: s.rolling(30, min_periods=1).mean())
+    trading["volatility_30d"] = trading.groupby("target_currency")["daily_pct_change"] \
+        .transform(lambda s: s.rolling(30, min_periods=2).std())
+
+    derived_cols = ["daily_pct_change", "ma_7", "ma_30", "volatility_30d"]
+    df = df.merge(
+        trading[["date", "target_currency"] + derived_cols],
+        on=["date", "target_currency"], how="left",
+    )
 
     df["day_of_week"] = df["date"].dt.day_name()
     df["month"] = df["date"].dt.month
